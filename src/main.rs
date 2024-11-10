@@ -77,10 +77,16 @@ impl LintLevel {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug)]
+struct Lint<'a> {
+    id: LintId<'a>,
+    group: LintGroup,
+}
+
+#[derive(Debug, Deserialize)]
 #[expect(dead_code, reason = "this is an external data definition")]
-struct Lint {
-    id: LintId,
+struct LintResponse {
+    id: String,
     group: LintGroup,
     #[serde(rename = "level")]
     default_level: LintLevel,
@@ -93,26 +99,41 @@ enum PrioritySetting {
     Unspecified,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-struct LintId(String);
+impl From<Option<isize>> for PrioritySetting {
+    fn from(value: Option<isize>) -> Self {
+        match value {
+            Some(i) => Self::Explicit(i),
+            None => Self::Unspecified,
+        }
+    }
+}
 
-impl fmt::Display for LintId {
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct LintId<'a>(&'a str);
+
+impl From<&'static str> for LintId<'static> {
+    fn from(value: &'static str) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for LintId<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-struct LintList(Vec<LintId>);
+struct LintList<'a>(Vec<LintId<'a>>);
 
-impl From<Vec<&str>> for LintList {
-    fn from(value: Vec<&str>) -> Self {
-        Self(value.into_iter().map(|s| LintId(s.to_owned())).collect())
+impl<'a> From<Vec<&'a str>> for LintList<'a> {
+    fn from(value: Vec<&'a str>) -> Self {
+        Self(value.into_iter().map(|s| LintId(s)).collect())
     }
 }
 
 #[derive(Debug)]
-struct SingleLintConfig {
-    lint: LintId,
+struct SingleLintConfig<'a> {
+    lint: &'a LintId<'a>,
     priority: PrioritySetting,
     level: LintLevel,
 }
@@ -125,8 +146,8 @@ struct GroupConfig {
 }
 
 #[derive(Debug)]
-enum Setting {
-    Single(SingleLintConfig),
+enum Setting<'a> {
+    Single(SingleLintConfig<'a>),
     Group(GroupConfig),
 }
 
@@ -137,38 +158,37 @@ enum ExhaustiveGroupClassification {
 }
 
 #[derive(Debug)]
-struct ExhausiveGroup {
-    defaults: Vec<Setting>,
-    exceptions: Vec<Setting>,
+struct ExhausiveGroup<'a> {
+    defaults: Vec<Setting<'a>>,
+    exceptions: Vec<Setting<'a>>,
 }
 
-struct Exceptions {
+struct Exceptions<'a> {
     level: LintLevel,
-    lints: LintList,
+    lints: LintList<'a>,
 }
 
-impl Setting {
-    fn set_group(group: LintGroup, priority: PrioritySetting, level: LintLevel) -> Self {
+impl<'a> Setting<'a> {
+    fn group(group: LintGroup, level: LintLevel, priority: impl Into<PrioritySetting>) -> Self {
         Self::Group(GroupConfig {
             group,
-            priority,
+            priority: priority.into(),
             level,
         })
     }
-    fn warn_group(group: LintGroup, priority: PrioritySetting) -> Self {
-        Self::set_group(group, priority, LintLevel::Warn)
-    }
 
-    fn deny_group(group: LintGroup, priority: PrioritySetting) -> Self {
-        Self::set_group(group, priority, LintLevel::Deny)
-    }
-
-    fn allow(response: &Response, group: LintGroup, lints: &[&str]) -> Result<Vec<Self>> {
+    fn allow(
+        all_lints: &'a AllLints,
+        group: LintGroup,
+        lints: &'a [LintId<'a>],
+    ) -> Result<Vec<Self>> {
         lints
             .iter()
             .map(|lint| {
-                let lint = LintId((*lint).to_owned());
-                let found = response.0.iter().find(|r| r.id == lint && r.group == group);
+                let found = all_lints
+                    .0
+                    .iter()
+                    .find(|r| r.id == *lint && r.group == group);
                 if found.is_none() {
                     Err(anyhow!("lint {} not in group {}", lint, group.as_str()))
                 } else {
@@ -183,37 +203,32 @@ impl Setting {
     }
 
     fn split_group_exhaustive(
-        response: &Response,
+        all_lints: &'a AllLints,
         group: LintGroup,
         default_level: LintLevel,
-        exceptions: &Exceptions,
-    ) -> Result<ExhausiveGroup> {
-        let all_lints_in_group: Vec<LintId> = response
+        exceptions: &Exceptions<'a>,
+    ) -> Result<ExhausiveGroup<'a>> {
+        let all_lints_in_group: Vec<&LintId> = all_lints
             .0
             .iter()
-            .filter_map(|lint| {
-                if lint.group == group {
-                    Some(lint.id.clone())
-                } else {
-                    None
-                }
-            })
+            .filter(|lint| lint.group == group)
+            .map(|lint| &lint.id)
             .collect();
 
-        if let Some(err) = exceptions.lints.0.iter().find_map(|lint| {
-            if !all_lints_in_group.contains(lint) {
-                Some(anyhow!("lint {lint} not part of group {group}"))
-            } else {
-                None
-            }
-        }) {
-            return Err(err);
-        };
+        let all_lints_in_group_len = all_lints_in_group.len();
+
+        exceptions
+            .lints
+            .0
+            .iter()
+            .find(|lint| (!all_lints_in_group.contains(lint)))
+            .map(|lint| Err(anyhow!("lint {lint} not part of group {group}")))
+            .unwrap_or(Ok(()))?;
 
         Ok(all_lints_in_group
             .into_iter()
             .map(|lint| {
-                if exceptions.lints.0.contains(&lint) {
+                if exceptions.lints.0.contains(lint) {
                     (
                         ExhaustiveGroupClassification::Exception,
                         Self::Single(SingleLintConfig {
@@ -234,9 +249,16 @@ impl Setting {
                 }
             })
             .fold(
-                ExhausiveGroup {
-                    defaults: Vec::new(),
-                    exceptions: Vec::new(),
+                {
+                    let len_1 = exceptions.lints.0.len();
+                    ExhausiveGroup {
+                        defaults: Vec::with_capacity(
+                            all_lints_in_group_len.checked_sub(len_1).expect(
+                                "exceptions are a subset of of all lints in group, checked above",
+                            ),
+                        ),
+                        exceptions: Vec::with_capacity(len_1),
+                    }
                 },
                 |mut acc, (classification, setting)| {
                     match classification {
@@ -250,15 +272,15 @@ impl Setting {
 }
 
 #[derive(Debug)]
-struct ConfigGroup {
+struct ConfigGroup<'a> {
     comment: Option<String>,
-    settings: Vec<Setting>,
+    settings: Vec<Setting<'a>>,
 }
 
 #[derive(Debug)]
-struct Config(Vec<ConfigGroup>);
+struct Config<'a>(Vec<ConfigGroup<'a>>);
 
-impl Config {
+impl Config<'_> {
     fn to_toml(&self, args: &Args) -> String {
         let mut output = if args.workspace {
             String::from("[workspace.lints.clippy]\n")
@@ -330,17 +352,37 @@ impl Config {
 }
 
 #[derive(Debug, Deserialize)]
-struct Response(Vec<Lint>);
+struct Response(Vec<LintResponse>);
+
+#[derive(Debug)]
+struct AllLints<'a>(Vec<Lint<'a>>);
+
+impl<'a> AllLints<'a> {
+    fn from_response(response: &'a Response) -> Self {
+        Self(
+            response
+                .0
+                .iter()
+                .map(|lint| Lint {
+                    id: LintId(&lint.id),
+                    group: lint.group,
+                })
+                .collect(),
+        )
+    }
+}
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let response: Response = ureq::get("https://rust-lang.github.io/rust-clippy/stable/lints.json")
         .call()?
-        .into_json()?;
+        .into_json::<Response>()?;
+
+    let all_lints = AllLints::from_response(&response);
 
     let restriction_group = Setting::split_group_exhaustive(
-        &response,
+        &all_lints,
         LintGroup::Restriction,
         LintLevel::Allow,
         &Exceptions {
@@ -429,60 +471,62 @@ fn main() -> Result<()> {
         },
     )?;
 
+    let cargo_lints = {
+        let mut v = vec!["multiple_crate_versions".into()];
+        match args.profile {
+            Profile::Publish => (),
+            Profile::Personal => v.push("cargo_common_metadata".into()),
+        }
+        v
+    };
+
+    let pedantic_allows = &[
+        "too_many_lines".into(),
+        "must_use_candidate".into(),
+        "map_unwrap_or".into(),
+        "missing_errors_doc".into(),
+        "if_not_else".into(),
+    ];
+
+    let nursery_allows = &["missing_const_for_fn".into(), "option_if_let_else".into()];
+
+    let complexity_allows = &["too_many_arguments".into()];
+
+    let style_allows = &["new_without_default".into(), "redundant_closure".into()];
+
     let config = Config(vec![
         ConfigGroup {
             comment: Some("enabled groups".to_owned()),
             settings: vec![
-                Setting::deny_group(LintGroup::Correctness, PrioritySetting::Explicit(-1)),
-                Setting::warn_group(LintGroup::Suspicious, PrioritySetting::Explicit(-1)),
-                Setting::warn_group(LintGroup::Style, PrioritySetting::Explicit(-1)),
-                Setting::warn_group(LintGroup::Complexity, PrioritySetting::Explicit(-1)),
-                Setting::warn_group(LintGroup::Perf, PrioritySetting::Explicit(-1)),
-                Setting::warn_group(LintGroup::Cargo, PrioritySetting::Explicit(-1)),
-                Setting::warn_group(LintGroup::Pedantic, PrioritySetting::Explicit(-1)),
-                Setting::warn_group(LintGroup::Nursery, PrioritySetting::Explicit(-1)),
+                Setting::group(LintGroup::Correctness, LintLevel::Deny, Some(-1)),
+                Setting::group(LintGroup::Suspicious, LintLevel::Warn, Some(-1)),
+                Setting::group(LintGroup::Style, LintLevel::Warn, Some(-1)),
+                Setting::group(LintGroup::Complexity, LintLevel::Warn, Some(-1)),
+                Setting::group(LintGroup::Perf, LintLevel::Warn, Some(-1)),
+                Setting::group(LintGroup::Cargo, LintLevel::Warn, Some(-1)),
+                Setting::group(LintGroup::Pedantic, LintLevel::Warn, Some(-1)),
+                Setting::group(LintGroup::Nursery, LintLevel::Warn, Some(-1)),
             ],
         },
         ConfigGroup {
             comment: Some("pedantic overrides".to_owned()),
-            settings: Setting::allow(
-                &response,
-                LintGroup::Pedantic,
-                &[
-                    "too_many_lines",
-                    "must_use_candidate",
-                    "map_unwrap_or",
-                    "missing_errors_doc",
-                    "if_not_else",
-                ],
-            )?,
+            settings: Setting::allow(&all_lints, LintGroup::Pedantic, pedantic_allows)?,
         },
         ConfigGroup {
             comment: Some("nursery overrides".to_owned()),
-            settings: Setting::allow(
-                &response,
-                LintGroup::Nursery,
-                &["missing_const_for_fn", "option_if_let_else"],
-            )?,
+            settings: Setting::allow(&all_lints, LintGroup::Nursery, nursery_allows)?,
         },
         ConfigGroup {
             comment: Some("complexity overrides".to_owned()),
-            settings: Setting::allow(&response, LintGroup::Complexity, &["too_many_arguments"])?,
+            settings: Setting::allow(&all_lints, LintGroup::Complexity, complexity_allows)?,
         },
         ConfigGroup {
             comment: Some("style overrides".to_owned()),
-            settings: Setting::allow(&response, LintGroup::Style, &["new_without_default"])?,
+            settings: Setting::allow(&all_lints, LintGroup::Style, style_allows)?,
         },
         ConfigGroup {
             comment: Some("cargo overrides".to_owned()),
-            settings: Setting::allow(&response, LintGroup::Cargo, &{
-                let mut v = vec!["multiple_crate_versions"];
-                match args.profile {
-                    Profile::Publish => (),
-                    Profile::Personal => v.push("cargo_common_metadata"),
-                }
-                v
-            })?,
+            settings: Setting::allow(&all_lints, LintGroup::Cargo, &cargo_lints)?,
         },
         ConfigGroup {
             comment: Some("selected restrictions".to_owned()),
