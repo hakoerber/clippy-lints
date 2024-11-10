@@ -42,6 +42,7 @@ too_many_arguments = "allow"
 
 # style overrides
 new_without_default = "allow"
+redundant_closure = "allow"
 
 # cargo overrides
 multiple_crate_versions = "allow"
