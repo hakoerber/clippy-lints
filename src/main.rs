@@ -488,7 +488,11 @@ fn main() -> Result<()> {
         "if_not_else".into(),
     ];
 
-    let nursery_allows = &["missing_const_for_fn".into(), "option_if_let_else".into()];
+    let nursery_allows = &[
+        "missing_const_for_fn".into(),
+        "option_if_let_else".into(),
+        "redundant_pub_crate".into(),
+    ];
 
     let complexity_allows = &["too_many_arguments".into()];
 
