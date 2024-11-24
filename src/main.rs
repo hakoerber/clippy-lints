@@ -486,6 +486,7 @@ fn main() -> Result<()> {
         "map_unwrap_or".into(),
         "missing_errors_doc".into(),
         "if_not_else".into(),
+        "similar_names".into(),
     ];
 
     let nursery_allows = &[
