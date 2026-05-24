@@ -1,23 +1,12 @@
-use std::fmt::{self, Write as _};
+use std::fmt::Write as _;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum LintGroup {
-    Cargo,
-    Complexity,
-    Correctness,
-    Nursery,
-    Pedantic,
-    Perf,
-    Restriction,
-    Style,
-    Suspicious,
-    Deprecated,
-}
+mod clippy;
+mod common;
+
+use clippy::{Lint, LintGroup, LintId, LintLevel};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Profile {
@@ -34,61 +23,11 @@ struct Args {
     workspace: bool,
 }
 
-impl LintGroup {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Cargo => "cargo",
-            Self::Complexity => "complexity",
-            Self::Correctness => "correctness",
-            Self::Nursery => "nursery",
-            Self::Pedantic => "pedantic",
-            Self::Perf => "perf",
-            Self::Restriction => "restriction",
-            Self::Style => "style",
-            Self::Suspicious => "suspicious",
-            Self::Deprecated => "deprecated",
-        }
-    }
-}
-
-impl fmt::Display for LintGroup {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum LintLevel {
-    Allow,
-    Warn,
-    Deny,
-    None,
-}
-
-impl LintLevel {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Allow => "allow",
-            Self::Warn => "warn",
-            Self::Deny => "deny",
-            Self::None => "none",
-        }
-    }
-}
-
 #[derive(Debug)]
-struct Lint<'a> {
-    id: LintId<'a>,
-    group: LintGroup,
-}
-
-#[derive(Debug, Deserialize)]
 #[expect(dead_code, reason = "this is an external data definition")]
 struct LintResponse {
     id: String,
     group: LintGroup,
-    #[serde(rename = "level")]
     default_level: LintLevel,
     version: String,
 }
@@ -108,32 +47,11 @@ impl From<Option<isize>> for PrioritySetting {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-struct LintId<'a>(&'a str);
-
-impl From<&'static str> for LintId<'static> {
-    fn from(value: &'static str) -> Self {
-        Self(value)
-    }
-}
-
-impl fmt::Display for LintId<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-struct LintList<'a>(Vec<LintId<'a>>);
-
-impl<'a> From<Vec<&'a str>> for LintList<'a> {
-    fn from(value: Vec<&'a str>) -> Self {
-        Self(value.into_iter().map(|s| LintId(s)).collect())
-    }
-}
+struct LintList(Vec<LintId>);
 
 #[derive(Debug)]
-struct SingleLintConfig<'a> {
-    lint: &'a LintId<'a>,
+struct SingleLintConfig {
+    lint: LintId,
     priority: PrioritySetting,
     level: LintLevel,
 }
@@ -146,8 +64,8 @@ struct GroupConfig {
 }
 
 #[derive(Debug)]
-enum Setting<'a> {
-    Single(SingleLintConfig<'a>),
+enum Setting {
+    Single(SingleLintConfig),
     Group(GroupConfig),
 }
 
@@ -158,17 +76,17 @@ enum ExhaustiveGroupClassification {
 }
 
 #[derive(Debug)]
-struct ExhausiveGroup<'a> {
-    defaults: Vec<Setting<'a>>,
-    exceptions: Vec<Setting<'a>>,
+struct ExhausiveGroup {
+    defaults: Vec<Setting>,
+    exceptions: Vec<Setting>,
 }
 
-struct Exceptions<'a> {
+struct Exceptions {
     level: LintLevel,
-    lints: LintList<'a>,
+    lints: LintList,
 }
 
-impl<'a> Setting<'a> {
+impl Setting {
     fn group(group: LintGroup, level: LintLevel, priority: impl Into<PrioritySetting>) -> Self {
         Self::Group(GroupConfig {
             group,
@@ -177,11 +95,7 @@ impl<'a> Setting<'a> {
         })
     }
 
-    fn allow(
-        all_lints: &'a AllLints,
-        group: LintGroup,
-        lints: &'a [LintId<'a>],
-    ) -> Result<Vec<Self>> {
+    fn allow(all_lints: &AllLints, group: LintGroup, lints: &[LintId]) -> Result<Vec<Self>> {
         lints
             .iter()
             .map(|lint| {
@@ -193,7 +107,7 @@ impl<'a> Setting<'a> {
                     Err(anyhow!("lint {} not in group {}", lint, group.as_str()))
                 } else {
                     Ok(Self::Single(SingleLintConfig {
-                        lint,
+                        lint: lint.clone(),
                         priority: PrioritySetting::Unspecified,
                         level: LintLevel::Allow,
                     }))
@@ -203,11 +117,11 @@ impl<'a> Setting<'a> {
     }
 
     fn split_group_exhaustive(
-        all_lints: &'a AllLints,
+        all_lints: &AllLints,
         group: LintGroup,
         default_level: LintLevel,
-        exceptions: &Exceptions<'a>,
-    ) -> Result<ExhausiveGroup<'a>> {
+        exceptions: &Exceptions,
+    ) -> Result<ExhausiveGroup> {
         let all_lints_in_group: Vec<&LintId> = all_lints
             .0
             .iter()
@@ -221,7 +135,7 @@ impl<'a> Setting<'a> {
             .lints
             .0
             .iter()
-            .find(|lint| (!all_lints_in_group.contains(lint)))
+            .find(|lint| !all_lints_in_group.contains(lint))
             .map(|lint| Err(anyhow!("lint {lint} not part of group {group}")))
             .unwrap_or(Ok(()))?;
 
@@ -232,7 +146,7 @@ impl<'a> Setting<'a> {
                     (
                         ExhaustiveGroupClassification::Exception,
                         Self::Single(SingleLintConfig {
-                            lint,
+                            lint: lint.clone(),
                             priority: PrioritySetting::Unspecified,
                             level: exceptions.level,
                         }),
@@ -241,7 +155,7 @@ impl<'a> Setting<'a> {
                     (
                         ExhaustiveGroupClassification::Default,
                         Self::Single(SingleLintConfig {
-                            lint,
+                            lint: lint.clone(),
                             priority: PrioritySetting::Unspecified,
                             level: default_level,
                         }),
@@ -264,7 +178,7 @@ impl<'a> Setting<'a> {
                     match classification {
                         ExhaustiveGroupClassification::Default => acc.defaults.push(setting),
                         ExhaustiveGroupClassification::Exception => acc.exceptions.push(setting),
-                    };
+                    }
                     acc
                 },
             ))
@@ -272,15 +186,15 @@ impl<'a> Setting<'a> {
 }
 
 #[derive(Debug)]
-struct ConfigGroup<'a> {
+struct ConfigGroup {
     comment: Option<String>,
-    settings: Vec<Setting<'a>>,
+    settings: Vec<Setting>,
 }
 
 #[derive(Debug)]
-struct Config<'a>(Vec<ConfigGroup<'a>>);
+struct Config(Vec<ConfigGroup>);
 
-impl Config<'_> {
+impl Config {
     fn to_toml(&self, args: &Args) -> String {
         let mut output = if args.workspace {
             String::from("[workspace.lints.clippy]\n")
@@ -304,16 +218,13 @@ impl Config<'_> {
                         PrioritySetting::Explicit(priority) => write!(
                             output,
                             "{} = {{ level = \"{}\", priority = {} }}",
-                            single_lint_config.lint.0,
-                            single_lint_config.level.as_str(),
-                            priority
+                            single_lint_config.lint, single_lint_config.level, priority
                         )
                         .expect("writing to string succeeds"),
                         PrioritySetting::Unspecified => write!(
                             output,
                             "{} = \"{}\"",
-                            single_lint_config.lint.0,
-                            single_lint_config.level.as_str()
+                            single_lint_config.lint, single_lint_config.level
                         )
                         .expect("writing to string succeeds"),
                     },
@@ -321,20 +232,17 @@ impl Config<'_> {
                         PrioritySetting::Explicit(priority) => write!(
                             output,
                             "{} = {{ level = \"{}\", priority = {} }}",
-                            group_config.group.as_str(),
-                            group_config.level.as_str(),
-                            priority
+                            group_config.group, group_config.level, priority
                         )
                         .expect("writing to string succeeds"),
                         PrioritySetting::Unspecified => write!(
                             output,
                             "{} = \"{}\"",
-                            group_config.group.as_str(),
-                            group_config.level.as_str(),
+                            group_config.group, group_config.level,
                         )
                         .expect("writing to string succeeds"),
                     },
-                };
+                }
                 if !last_setting {
                     output.push('\n');
                 }
@@ -351,35 +259,21 @@ impl Config<'_> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct Response(Vec<LintResponse>);
-
 #[derive(Debug)]
-struct AllLints<'a>(Vec<Lint<'a>>);
+struct AllLints(&'static [Lint]);
 
-impl<'a> AllLints<'a> {
-    fn from_response(response: &'a Response) -> Self {
-        Self(
-            response
-                .0
-                .iter()
-                .map(|lint| Lint {
-                    id: LintId(&lint.id),
-                    group: lint.group,
-                })
-                .collect(),
-        )
+impl AllLints {
+    fn from_source() -> Self {
+        Self(clippy::get_lints())
     }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let response: Response = ureq::get("https://rust-lang.github.io/rust-clippy/stable/lints.json")
-        .call()?
-        .into_json::<Response>()?;
+    let all_lints = AllLints::from_source();
 
-    let all_lints = AllLints::from_response(&response);
+    assert!(!all_lints.0.is_empty(), "no lints found at all");
 
     let restriction_group = Setting::split_group_exhaustive(
         &all_lints,
@@ -387,87 +281,88 @@ fn main() -> Result<()> {
         LintLevel::Allow,
         &Exceptions {
             level: LintLevel::Warn,
-            lints: vec![
-                "allow_attributes",
-                "allow_attributes_without_reason",
-                "arithmetic_side_effects",
-                "as_conversions",
-                "assertions_on_result_states",
-                "cfg_not_test",
-                "clone_on_ref_ptr",
-                "create_dir",
-                "dbg_macro",
-                "decimal_literal_representation",
-                "default_numeric_fallback",
-                "deref_by_slicing",
-                "disallowed_script_idents",
-                "else_if_without_else",
-                "empty_drop",
-                "empty_enum_variants_with_brackets",
-                "empty_structs_with_brackets",
-                "exit",
-                "filetype_is_file",
-                "float_arithmetic",
-                "float_cmp_const",
-                "fn_to_numeric_cast_any",
-                "format_push_string",
-                "get_unwrap",
-                "indexing_slicing",
-                "infinite_loop",
-                "inline_asm_x86_att_syntax",
-                "inline_asm_x86_intel_syntax",
-                "integer_division",
-                "iter_over_hash_type",
-                "large_include_file",
-                "let_underscore_must_use",
-                "let_underscore_untyped",
-                "little_endian_bytes",
-                "lossy_float_literal",
-                "map_err_ignore",
-                "mem_forget",
-                "missing_assert_message",
-                "missing_asserts_for_indexing",
-                "mixed_read_write_in_expression",
-                "modulo_arithmetic",
-                "multiple_inherent_impl",
-                "multiple_unsafe_ops_per_block",
-                "mutex_atomic",
-                "panic",
-                "partial_pub_fields",
-                "pattern_type_mismatch",
-                "print_stderr",
-                "print_stdout",
-                "pub_without_shorthand",
-                "rc_buffer",
-                "rc_mutex",
-                "redundant_type_annotations",
-                "renamed_function_params",
-                "rest_pat_in_fully_bound_structs",
-                "same_name_method",
-                "self_named_module_files",
-                "semicolon_inside_block",
-                "str_to_string",
-                "string_add",
-                "string_lit_chars_any",
-                "string_slice",
-                "string_to_string",
-                "suspicious_xor_used_as_pow",
-                "tests_outside_test_module",
-                "todo",
-                "try_err",
-                "undocumented_unsafe_blocks",
-                "unimplemented",
-                "unnecessary_safety_comment",
-                "unnecessary_safety_doc",
-                "unnecessary_self_imports",
-                "unneeded_field_pattern",
-                "unseparated_literal_suffix",
-                "unused_result_ok",
-                "unwrap_used",
-                "use_debug",
-                "verbose_file_reads",
-            ]
-            .into(),
+            lints: LintList(
+                [
+                    "allow_attributes",
+                    "allow_attributes_without_reason",
+                    "arithmetic_side_effects",
+                    "as_conversions",
+                    "assertions_on_result_states",
+                    "cfg_not_test",
+                    "clone_on_ref_ptr",
+                    "create_dir",
+                    "dbg_macro",
+                    "decimal_literal_representation",
+                    "default_numeric_fallback",
+                    "deref_by_slicing",
+                    "disallowed_script_idents",
+                    "empty_drop",
+                    "empty_enum_variants_with_brackets",
+                    "empty_structs_with_brackets",
+                    "exit",
+                    "filetype_is_file",
+                    "float_arithmetic",
+                    "float_cmp_const",
+                    "fn_to_numeric_cast_any",
+                    "get_unwrap",
+                    "indexing_slicing",
+                    "infinite_loop",
+                    "inline_asm_x86_att_syntax",
+                    "inline_asm_x86_intel_syntax",
+                    "integer_division",
+                    "iter_over_hash_type",
+                    "large_include_file",
+                    "let_underscore_must_use",
+                    "let_underscore_untyped",
+                    "little_endian_bytes",
+                    "lossy_float_literal",
+                    "map_err_ignore",
+                    "mem_forget",
+                    "missing_assert_message",
+                    "missing_asserts_for_indexing",
+                    "mixed_read_write_in_expression",
+                    "modulo_arithmetic",
+                    "multiple_inherent_impl",
+                    "multiple_unsafe_ops_per_block",
+                    "mutex_atomic",
+                    "panic",
+                    "partial_pub_fields",
+                    "pattern_type_mismatch",
+                    "print_stderr",
+                    "print_stdout",
+                    "pub_without_shorthand",
+                    "rc_buffer",
+                    "rc_mutex",
+                    "redundant_type_annotations",
+                    "renamed_function_params",
+                    "rest_pat_in_fully_bound_structs",
+                    "same_name_method",
+                    "self_named_module_files",
+                    "semicolon_inside_block",
+                    "str_to_string",
+                    "string_add",
+                    "string_lit_chars_any",
+                    "string_slice",
+                    "suspicious_xor_used_as_pow",
+                    "tests_outside_test_module",
+                    "todo",
+                    "try_err",
+                    "undocumented_unsafe_blocks",
+                    "unimplemented",
+                    "unnecessary_safety_comment",
+                    "unnecessary_safety_doc",
+                    "unnecessary_self_imports",
+                    "unneeded_field_pattern",
+                    "unseparated_literal_suffix",
+                    "unused_result_ok",
+                    "unwrap_used",
+                    "use_debug",
+                    "verbose_file_reads",
+                ]
+                .into_iter()
+                .map(|s| LintId::new(s.to_owned()))
+                .collect(),
+            ),
         },
     )?;
 
@@ -487,6 +382,7 @@ fn main() -> Result<()> {
         "missing_errors_doc".into(),
         "if_not_else".into(),
         "similar_names".into(),
+        "redundant_else".into(),
     ];
 
     let nursery_allows = &[
@@ -536,10 +432,6 @@ fn main() -> Result<()> {
         ConfigGroup {
             comment: Some("selected restrictions".to_owned()),
             settings: restriction_group.exceptions,
-        },
-        ConfigGroup {
-            comment: Some("restrictions explicit allows".to_owned()),
-            settings: restriction_group.defaults,
         },
     ]);
 
